@@ -335,7 +335,8 @@ function toggleAuthRefRequired() {
   const type = $("#server-form").auth_type.value;
   const req  = $("#auth-ref-req");
   const input = $("#server-form").auth_ref;
-  if (type === "bearer") {
+  // Both bearer and api_key resolve their secret via auth_ref (KV pointer).
+  if (type === "bearer" || type === "api_key") {
     show(req);
     input.required = true;
   } else {

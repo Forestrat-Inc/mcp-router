@@ -14,7 +14,7 @@ from app.config import settings
 _KV_URI_RE = re.compile(r"^kv://[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
 VALID_TRANSPORTS = {"http", "sse", "ws", "stdio"}
-VALID_AUTH_TYPES = {"none", "bearer", "oauth", "mtls", "header"}
+VALID_AUTH_TYPES = {"none", "bearer", "api_key", "oauth", "mtls", "header"}
 VALID_STATUSES = {"active", "disabled", "deprecated"}
 
 

@@ -119,7 +119,8 @@
             Auth type <span class="req">*</span>
             <select name="auth_type" required>
               <option value="none">none</option>
-              <option value="bearer">bearer</option>
+              <option value="bearer">bearer  (sent as Authorization: Bearer &lt;secret&gt;)</option>
+              <option value="api_key">api_key (sent as X-API-Key: &lt;secret&gt;)</option>
               <option value="oauth" disabled>oauth (not yet supported)</option>
               <option value="mtls" disabled>mtls (not yet supported)</option>
               <option value="header" disabled>header (not yet supported)</option>

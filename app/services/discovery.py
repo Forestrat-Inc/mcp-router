@@ -63,13 +63,27 @@ def _resolve_kv_secret(auth_ref: str) -> Optional[str]:
         return None
 
 
+def _attach_auth(headers: dict, auth_type: str, auth_ref: Optional[str]) -> None:
+    """Resolve the auth_ref secret and attach the right header.
+
+    Kept out of the call sites so discovery + propose share exactly one
+    place where the mapping ``auth_type → header shape`` lives.
+    """
+    if not auth_ref:
+        return
+    secret = _resolve_kv_secret(auth_ref)
+    if not secret:
+        return
+    if auth_type == "bearer":
+        headers["Authorization"] = f"Bearer {secret}"
+    elif auth_type == "api_key":
+        headers["X-API-Key"] = secret
+
+
 def call_discover(endpoint_url: str, auth_type: str, auth_ref: Optional[str]) -> DiscoveryResponse:
     """POST tools/call aims_discover_capabilities against a server."""
     headers = {"Content-Type": "application/json"}
-    if auth_type == "bearer" and auth_ref:
-        token = _resolve_kv_secret(auth_ref)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+    _attach_auth(headers, auth_type, auth_ref)
 
     payload = {
         "jsonrpc": "2.0",

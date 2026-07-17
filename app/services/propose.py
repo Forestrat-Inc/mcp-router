@@ -20,7 +20,7 @@ from app.schemas.mcp_server import (
     ProposeRequest,
     ProposeResponse,
 )
-from app.services.discovery import _resolve_kv_secret
+from app.services.discovery import _attach_auth
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +78,7 @@ def forward_propose(server: MCPServer, req: ProposeRequest) -> Optional[ProposeR
         )
 
     headers = {"Content-Type": "application/json"}
-    if server.auth_type == "bearer" and server.auth_ref:
-        token = _resolve_kv_secret(server.auth_ref)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+    _attach_auth(headers, server.auth_type, server.auth_ref)
 
     # Cap the timeout at the router's global setting; server can go lower via
     # its declared max_response_ms.
