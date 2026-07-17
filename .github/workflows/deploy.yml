@@ -1,0 +1,153 @@
+name: Deploy
+
+# Standalone repo now — every push to main is an mcp-router change,
+# so no `#mcp` gate. Manual dispatch still supported.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "alembic/**"
+      - "reference-stub/**"
+      - "k8s/**"
+      - "Dockerfile"
+      - "requirements.txt"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Which service to deploy (default: all)"
+        required: false
+        default: "all"
+        type: choice
+        options: ["all", "router", "reference-stub"]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR: forestratacr.azurecr.io
+  AKS_CLUSTER: forestrat-aks
+  AKS_RG: forestrat-rg
+  NAMESPACE: mcp
+
+jobs:
+  build-and-deploy:
+    name: "${{ matrix.service }} build + deploy"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: router
+            dir: .
+            image: mcp-router
+            deployment: mcp-router
+            port: "8003"
+            has_secrets: "true"
+            has_ingress: "true"
+          - service: reference-stub
+            dir: reference-stub
+            image: mcp-stub
+            deployment: mcp-stub
+            port: "9000"
+            has_secrets: "false"
+            has_ingress: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip when dispatch picks a different service
+        id: skip
+        run: |
+          want="${{ github.event.inputs.service }}"
+          if [ -z "$want" ] || [ "$want" = "all" ]; then
+            echo "go=true" >> $GITHUB_OUTPUT
+          elif [ "$want" = "${{ matrix.service }}" ]; then
+            echo "go=true" >> $GITHUB_OUTPUT
+          else
+            echo "go=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Azure login (OIDC federated)
+        if: steps.skip.outputs.go == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        if: steps.skip.outputs.go == 'true'
+        run: az acr login -n forestratacr
+
+      - name: Docker build + push
+        if: steps.skip.outputs.go == 'true'
+        working-directory: ${{ matrix.dir }}
+        env:
+          SHA: ${{ github.sha }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker build -t $ACR/$IMAGE:$SHA -t $ACR/$IMAGE:latest .
+          docker push $ACR/$IMAGE:$SHA
+          docker push $ACR/$IMAGE:latest
+
+      - name: AKS context
+        if: steps.skip.outputs.go == 'true'
+        run: az aks get-credentials -g $AKS_RG -n $AKS_CLUSTER --overwrite-existing
+
+      - name: Ensure SA + SPC + Service (+ Ingress for the router)
+        if: steps.skip.outputs.go == 'true'
+        env:
+          DIR: ${{ matrix.dir }}
+          HAS_SECRETS: ${{ matrix.has_secrets }}
+          HAS_INGRESS: ${{ matrix.has_ingress }}
+        run: |
+          # Namespace + workload SA are provisioned separately (Azure
+          # federated credential + SA object; documented in README).
+          if [ "$HAS_SECRETS" = "true" ]; then
+            kubectl apply -f "$DIR/k8s/secretproviderclass.yaml"
+          fi
+          kubectl apply -f "$DIR/k8s/service.yaml"
+          if [ "$HAS_INGRESS" = "true" ]; then
+            kubectl apply -f "$DIR/k8s/ingress.yaml"
+          fi
+
+      - name: Render + apply Deployment
+        if: steps.skip.outputs.go == 'true'
+        env:
+          SHA: ${{ github.sha }}
+          DIR: ${{ matrix.dir }}
+        run: |
+          sed "s|__IMAGE_TAG__|$SHA|g" "$DIR/k8s/deployment.yaml" | kubectl apply -f -
+
+      - name: Wait for rollout
+        if: steps.skip.outputs.go == 'true'
+        env:
+          DEPLOYMENT: ${{ matrix.deployment }}
+        run: |
+          kubectl rollout status -n $NAMESPACE deployment/$DEPLOYMENT --timeout=10m
+
+      - name: Smoke (in-cluster health)
+        if: steps.skip.outputs.go == 'true'
+        env:
+          DEPLOYMENT: ${{ matrix.deployment }}
+          PORT: ${{ matrix.port }}
+        run: |
+          kubectl wait --for=condition=Available deployment/$DEPLOYMENT \
+            -n $NAMESPACE --timeout=180s
+          kubectl run smoke-${{ github.run_id }}-${{ matrix.service }} -n $NAMESPACE \
+            --image=curlimages/curl:8.10.0 --restart=Never --rm -i --quiet \
+            --command -- sh -c '
+              for i in 1 2 3 4 5 6 7 8 9 10; do
+                if curl -sS --max-time 8 http://'"$DEPLOYMENT"'.mcp.svc.cluster.local:'"$PORT"'/health; then
+                  echo
+                  exit 0
+                fi
+                echo "smoke probe attempt $i failed, retrying in 5s..."
+                sleep 5
+              done
+              echo "smoke probe gave up after 10 attempts"
+              exit 1
+            '
