@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # Own ingress in the mcp namespace, keeps things self-contained. When
+  # NGINX-ingress merges rules for the same host across namespaces, this
+  # /api/mcp entry sits alongside AIMS's other paths without either side
+  # needing to know about the other's manifests.
+  name: mcp-router
+  namespace: mcp
+  labels:
+    app: mcp-router
+    app.kubernetes.io/component: mcp-router
+    app.kubernetes.io/part-of: mcp-router
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: aims-az.forestrat.ai
+      http:
+        paths:
+          - path: /api/mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-router
+                port:
+                  number: 8003
+  tls:
+    - hosts:
+        - aims-az.forestrat.ai
+      # Reuses the cert-manager-issued TLS cert. mcp namespace has to
+      # have its own Secret; we let cert-manager mint one via the same
+      # letsencrypt-prod ClusterIssuer.
+      secretName: mcp-router-tls

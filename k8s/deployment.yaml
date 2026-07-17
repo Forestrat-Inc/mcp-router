@@ -2,11 +2,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcp-router
-  namespace: aims
+  namespace: mcp
   labels:
     app: mcp-router
     app.kubernetes.io/component: mcp-router
-    app.kubernetes.io/part-of: aims
+    app.kubernetes.io/part-of: mcp-router
 spec:
   replicas: 1
   selector:
@@ -23,7 +23,7 @@ spec:
         app: mcp-router
         azure.workload.identity/use: "true"
     spec:
-      serviceAccountName: aims-workload
+      serviceAccountName: mcp-workload
       terminationGracePeriodSeconds: 30
       containers:
         - name: mcp-router

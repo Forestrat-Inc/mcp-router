@@ -2,11 +2,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mcp-stub
-  namespace: aims
+  namespace: mcp
   labels:
     app: mcp-stub
     app.kubernetes.io/component: mcp-stub
-    app.kubernetes.io/part-of: aims
+    app.kubernetes.io/part-of: mcp-router
 spec:
   replicas: 1
   selector:
