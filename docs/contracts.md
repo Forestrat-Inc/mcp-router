@@ -281,7 +281,7 @@ Content-Type: application/json
   "endpoint_url": "https://mcp-trading.internal.forestrat.ai/mcp",
   "auth_type": "bearer",
   "auth_ref": "kv://forestrat-kv/trading-ui-mcp-token",
-  "owner_email": "tradestrat-team@forestrat.ai",
+  "owner_email": "trading-ui-team@forestrat.ai",
   "status": "active"
 }
 ```
@@ -403,7 +403,7 @@ The **agent-service change is additive**. Existing "Resolve with AI" continues t
 ## 12. Reference implementations
 
 - **Stub server** (test-only): `backend/aims-mcp-router/tests/stub_server/` — 80 lines of FastAPI that answers discovery + returns a canned `aims_propose_resolution` response echoing the input. Used in e2e smoke tests.
-- **Trading UI resolver**: not yet built — tradestrat-team target for phase 2.
+- **Trading UI resolver**: not yet built — trading-ui-team target for phase 2.
 - **AIMS's own generic MCP server**: not built — could be a v3 "if no app-specific server is registered, use this internal one as a fallback."
 
 ---
