@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mcp-router — Config</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- ── Auth gate ────────────────────────────────────────────────── -->
+  <div id="auth-gate" class="auth-gate hidden">
+    <div class="auth-card">
+      <h1>mcp-router</h1>
+      <p class="muted">Application_id → MCP server registry</p>
+      <label>
+        API key
+        <input id="api-key-input" type="password" autofocus autocomplete="off"
+               placeholder="X-API-Key value from your admin" />
+      </label>
+      <button id="auth-btn">Sign in</button>
+      <div id="auth-error" class="error hidden"></div>
+      <div class="muted small">
+        Your key is kept in <code>sessionStorage</code> only — never persisted.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Main app ─────────────────────────────────────────────────── -->
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <div class="brand">
+        <strong>mcp-router</strong>
+        <span class="muted">·</span>
+        <span class="muted small">Config</span>
+      </div>
+      <div class="topbar-actions">
+        <span id="user-hint" class="muted small"></span>
+        <button id="logout-btn" class="ghost">Sign out</button>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="toolbar">
+        <div class="filter-group">
+          <input id="filter-input" type="search" placeholder="Filter by name or application id…" />
+          <select id="status-filter">
+            <option value="">All statuses</option>
+            <option value="active">Active</option>
+            <option value="disabled">Disabled</option>
+            <option value="deprecated">Deprecated</option>
+          </select>
+        </div>
+        <div class="toolbar-actions">
+          <button id="refresh-btn" class="ghost">Refresh</button>
+          <button id="new-btn" class="primary">+ Register server</button>
+        </div>
+      </div>
+
+      <div id="status-bar" class="status-bar muted small"></div>
+
+      <div id="servers-list" class="cards"></div>
+
+      <div id="empty-state" class="empty hidden">
+        <p>No MCP servers registered yet.</p>
+        <button class="primary" onclick="document.getElementById('new-btn').click()">
+          Register your first one
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <!-- ── Register / Edit form modal ───────────────────────────────── -->
+  <div id="form-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <header class="modal-head">
+        <h2 id="form-title">Register MCP server</h2>
+        <button id="form-close" class="ghost">Close</button>
+      </header>
+      <form id="server-form" class="form">
+        <label>
+          Application ID <span class="req">*</span>
+          <input name="application_id" required
+                 pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+                 placeholder="UUID from your incident registry"
+                 title="Must be a UUID" />
+          <span class="hint">Immutable after creation.</span>
+        </label>
+        <label>
+          Name <span class="req">*</span>
+          <input name="name" required maxlength="255" placeholder="trading-ui-resolver" />
+        </label>
+        <div class="form-row">
+          <label>
+            Transport <span class="req">*</span>
+            <select name="transport" required>
+              <option value="http">http</option>
+              <option value="sse" disabled>sse (not yet supported)</option>
+              <option value="ws" disabled>ws (not yet supported)</option>
+              <option value="stdio" disabled>stdio (not yet supported)</option>
+            </select>
+          </label>
+          <label>
+            Status <span class="req">*</span>
+            <select name="status" required>
+              <option value="active">active</option>
+              <option value="disabled">disabled</option>
+              <option value="deprecated">deprecated</option>
+            </select>
+          </label>
+        </div>
+        <label>
+          Endpoint URL <span class="req">*</span>
+          <input name="endpoint_url" required type="url"
+                 placeholder="https://mcp-trading.internal.forestrat.ai/mcp" />
+          <span class="hint">Router calls <code>&lt;endpoint&gt;/tools/call</code> for both discovery and propose.</span>
+        </label>
+        <div class="form-row">
+          <label>
+            Auth type <span class="req">*</span>
+            <select name="auth_type" required>
+              <option value="none">none</option>
+              <option value="bearer">bearer</option>
+              <option value="oauth" disabled>oauth (not yet supported)</option>
+              <option value="mtls" disabled>mtls (not yet supported)</option>
+              <option value="header" disabled>header (not yet supported)</option>
+            </select>
+          </label>
+          <label>
+            Auth ref <span id="auth-ref-req" class="req hidden">*</span>
+            <input name="auth_ref"
+                   placeholder="kv://forestrat-kv/trading-ui-mcp-token"
+                   pattern="^(kv://[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)?$"
+                   title="Must be a kv://<vault>/<name> URI or blank" />
+            <span class="hint">Blank for <code>auth_type=none</code>. Router refuses raw tokens by shape.</span>
+          </label>
+        </div>
+        <label>
+          Owner email
+          <input name="owner_email" type="email" placeholder="trading-team@forestrat.ai" />
+        </label>
+        <label id="write-capable-row" class="hidden warn">
+          <input type="checkbox" name="i_accept_write_capable_server" value="true" />
+          I understand this server declares <code>read_only_default: false</code> and can execute actions.
+        </label>
+        <div id="form-error" class="error hidden"></div>
+        <div class="form-actions">
+          <button type="button" id="form-cancel" class="ghost">Cancel</button>
+          <button type="submit" id="form-submit" class="primary">Register</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Detail modal ─────────────────────────────────────────────── -->
+  <div id="detail-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card wide">
+      <header class="modal-head">
+        <h2 id="detail-title">Server detail</h2>
+        <button id="detail-close" class="ghost">Close</button>
+      </header>
+      <div id="detail-body" class="detail-body"></div>
+    </div>
+  </div>
+
+  <!-- ── Confirm dialog ───────────────────────────────────────────── -->
+  <div id="confirm-modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card narrow">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-body" class="muted"></p>
+      <div class="form-actions">
+        <button id="confirm-cancel" class="ghost">Cancel</button>
+        <button id="confirm-ok" class="danger">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

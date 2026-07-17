@@ -106,6 +106,22 @@ curl -X POST https://<router-host>/api/mcp/apps \
 
 Toggle `incident.metadata.stub_response = "unable"` in the proposal request to exercise the `unable_to_diagnose=true` path.
 
+## Config UI
+
+The router ships with a single-page admin UI at **`/api/mcp/ui/`** — vanilla
+HTML/CSS/JS, no build step, no separate pod. Users sign in with an
+`X-API-Key` (kept only in the browser's `sessionStorage`) and can:
+
+- List every registered MCP server, filter by name or status.
+- Register a new server (client-side UUID + URL validation; the router's
+  discovery call still gates persistence server-side).
+- Edit endpoint, auth, status, owner.
+- View the full capabilities snapshot + audit history for one server.
+- Force a cache invalidate.
+- Soft-delete (deprecate) a server.
+
+Public path via the standard ingress: `https://<router-host>/api/mcp/ui/`.
+
 ## Extraction from this repo (future)
 
 When it's time to move to its own repo:
