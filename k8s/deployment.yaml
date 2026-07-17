@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-router
+  namespace: aims
+  labels:
+    app: mcp-router
+    app.kubernetes.io/component: mcp-router
+    app.kubernetes.io/part-of: aims
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-router
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mcp-router
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: aims-workload
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mcp-router
+          image: forestratacr.azurecr.io/mcp-router:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          # Alembic-at-boot; same wrapper as aims-rule-engine.
+          command: ["sh", "-c"]
+          args:
+            - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8003"
+          ports:
+            - containerPort: 8003
+              name: http
+          env:
+            - name: LOG_LEVEL
+              value: INFO
+            - name: PORT
+              value: "8003"
+
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-router-secrets
+                  key: postgres-dsn
+            - name: DB_SCHEMA
+              value: "mcp_router"
+
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-router-secrets
+                  key: redis-url
+
+            # Router-owned auth. `both` accepts either a JWT signed
+            # with our own JWT_SECRET or an API key from the two
+            # comma-separated lists below. Rotate any secret in-place
+            # via KV without a code deploy.
+            - name: AUTH_MODE
+              value: "both"
+            - name: JWT_ALGORITHM
+              value: "HS256"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-router-secrets
+                  key: jwt-secret
+            - name: API_KEYS_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-router-secrets
+                  key: api-keys-admin
+            - name: API_KEYS_READER
+              valueFrom:
+                secretKeyRef:
+                  name: mcp-router-secrets
+                  key: api-keys-reader
+
+            - name: DISCOVERY_TIMEOUT_MS
+              value: "10000"
+            - name: RESOLUTION_CALL_TIMEOUT_MS
+              value: "30000"
+
+            - name: CORS_ALLOWED_ORIGINS
+              value: "https://aims-az.forestrat.ai,http://localhost:5173,http://localhost:3000"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8003
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8003
+            periodSeconds: 10
+          volumeMounts:
+            - name: secrets
+              mountPath: /mnt/secrets
+              readOnly: true
+      volumes:
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: keyvault-mcp-router

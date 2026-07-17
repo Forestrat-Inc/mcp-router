@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-stub
+  namespace: aims
+  labels:
+    app: mcp-stub
+    app.kubernetes.io/component: mcp-stub
+    app.kubernetes.io/part-of: aims
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-stub
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mcp-stub
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: stub
+          image: forestratacr.azurecr.io/mcp-stub:__IMAGE_TAG__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9000
+              name: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            periodSeconds: 10
