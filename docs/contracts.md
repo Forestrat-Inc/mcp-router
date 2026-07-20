@@ -295,15 +295,16 @@ Registration is per-application, not per-instance. If Trading UI dev/staging/pro
 
 ## 4. Transport
 
-**HTTP JSON-over-POST is the only supported transport in v1.**
+**Streamable-HTTP MCP is the only supported transport.** This is the modern MCP network transport (spec revision `2025-03-26`). The router uses the official Python MCP client SDK (`mcp>=1.2.0`) — servers should be built with `fastmcp`, the reference `mcp-python` server, the TypeScript `@modelcontextprotocol/sdk`, or any other streamable-HTTP MCP implementation.
 
-Not stdio, not SSE, not WebSocket. Reasons:
-- HTTP is the least-effort surface for any team to stand up.
-- Stateless per-request scales naturally.
-- Cache and rate-limit at the ingress layer.
-- WebSocket + SSE only pay off when the MCP server pushes unsolicited events to AIMS — not a use case for resolution.
+Not stdio (subprocess only; wrong network model). Not classic SSE (deprecated by the spec; two-endpoint dance + persistent connection fights AKS ingress). Not WebSocket (never in the MCP spec).
 
-The MCP server's endpoint URL is any path the team wants. AIMS POSTs to `<endpoint_url>/tools/call` with the standard MCP payload:
+Streamable-HTTP means:
+
+- **Single endpoint** the client POSTs to (e.g. `http://your-svc.your-ns.svc.cluster.local:PORT/mcp/`).
+- **Every request declares** `Accept: application/json, text/event-stream` — the server may respond with a plain JSON body OR upgrade the response to an SSE stream. The client library handles both transparently.
+- **Session lifecycle**: the client sends `initialize` first, receives a session id in the `Mcp-Session-Id` response header, and echoes that header on all subsequent requests in the session. The SDK handles this — servers don't do bookkeeping.
+- **Tool call wire format**:
 
 ```json
 {
@@ -317,7 +318,11 @@ The MCP server's endpoint URL is any path the team wants. AIMS POSTs to `<endpoi
 }
 ```
 
-Servers may also implement the MCP `tools/list` handshake if they want to advertise beyond the required three tools — the agent will surface those tools to the LLM naturally when in "MCP-enriched" mode.
+But **do not build this by hand** — use an MCP SDK. Bespoke `httpx.post` against `/tools/call` skips the initialize handshake and misses the Accept/session headers; spec-compliant servers reject it with `406 Not Acceptable` or `400 Missing session ID`.
+
+Servers may also implement `tools/list` to advertise beyond the required three tools — the agent will surface those tools to the LLM in "MCP-enriched" mode.
+
+**Registration `endpoint_url`**: use the URL the SDK will POST to. For fastmcp mounted at `/mcp/`, register `http://your-svc:PORT/mcp/` — with the trailing slash. Bare `/mcp` responds `307 Temporary Redirect` to `/mcp/`; the SDK follows redirects, but avoiding the round-trip is cheap.
 
 ---
 

@@ -1,35 +1,44 @@
-"""Reference stub MCP server — implements the AIMS resolution contract.
+"""Reference stub MCP server — implements the AIMS resolution contract as
+a *real, spec-compliant streamable-HTTP MCP server* using fastmcp.
 
 Purpose: provide a canned server the mcp-router can register and the
 agent-service can call end-to-end for smoke tests. Real teams onboard by
 implementing this same shape in their own service.
 
-Behavior:
-  * aims_discover_capabilities → declares handles for Trading UI's alert
-    types + protocol_version="1", read_only_default=true.
-  * aims_propose_resolution → echoes the input incident and returns a
-    canned analysis + one diagnostic action + one remediation action.
-    When ``metadata.stub_response`` is set to "unable" on the incoming
-    incident, returns unable_to_diagnose=true so the agent-side path
-    for that response shape can be exercised.
+What makes this a real MCP server (vs the earlier bespoke JSON endpoint):
+  * ``initialize`` / ``notifications/initialized`` handshake handled by fastmcp
+  * ``tools/list`` / ``tools/call`` handled by fastmcp
+  * ``Mcp-Session-Id`` header management handled by fastmcp
+  * SSE-per-response responses (``Accept: text/event-stream``)
 
-Not for production — no auth, no rate limit, no real logic. AKS pod for
-in-cluster access only.
+Tools:
+  * ``aims_discover_capabilities`` — declares handles + declared_actions.
+  * ``aims_propose_resolution`` — echoes the input incident and returns a
+    canned analysis + one diagnostic action + one remediation action.
+    When ``incident.metadata.stub_response == "unable"``, returns
+    ``unable_to_diagnose=true`` so the agent's alternate render path can
+    be exercised.
+
+Not for production — no auth, no rate limit, no real reasoning. AKS pod
+for in-cluster access only.
 """
 
-import json
-import logging
-from typing import Any, Dict
+from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException, Request
+import logging
+from typing import Any, Dict, Optional
+
+from fastmcp import FastMCP
+from fastapi import FastAPI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AIMS MCP reference stub", version="0.1.0")
+
+mcp = FastMCP(name="mcp-stub", version="0.1.0")
 
 
-DISCOVER_RESPONSE = {
+DISCOVER_RESPONSE: Dict[str, Any] = {
     "protocol_version": "1",
     "server_name": "mcp-stub",
     "server_version": "0.1.0",
@@ -48,20 +57,35 @@ DISCOVER_RESPONSE = {
 }
 
 
-def _wrap_result(payload: Dict[str, Any], call_id: str) -> Dict[str, Any]:
-    """Wrap a tool result in MCP JSON-RPC + text-content shape."""
-    return {
-        "jsonrpc": "2.0",
-        "id": call_id,
-        "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
-    }
+@mcp.tool()
+def aims_discover_capabilities() -> Dict[str, Any]:
+    """Return this server's capability declaration. Called once by the
+    router at registration time."""
+    logger.info("discover_called")
+    return DISCOVER_RESPONSE
 
 
-def _propose_response(args: Dict[str, Any]) -> Dict[str, Any]:
-    incident = args.get("incident") or {}
-    similar = (args.get("context") or {}).get("similar_past_incidents") or []
-    runbooks = (args.get("context") or {}).get("runbooks") or []
+@mcp.tool()
+def aims_propose_resolution(
+    incident: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None,
+    constraints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return a canned proposal for the incoming incident.
+
+    ``stub_response="unable"`` in incident.metadata triggers the
+    unable_to_diagnose path so the agent's alternate rendering can be
+    smoke-tested.
+    """
+    ctx = context or {}
+    similar = ctx.get("similar_past_incidents") or []
+    runbooks = ctx.get("runbooks") or []
     stub_flag = (incident.get("metadata") or {}).get("stub_response")
+
+    logger.info(
+        "propose_called incident_id=%s severity=%s similar=%d runbooks=%d",
+        incident.get("id"), incident.get("severity"), len(similar), len(runbooks),
+    )
 
     if stub_flag == "unable":
         return {
@@ -127,29 +151,20 @@ def _propose_response(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ── HTTP surface ────────────────────────────────────────────────────────
+# fastmcp gives us a Starlette app for the streamable-HTTP MCP endpoint.
+# We front it with a tiny FastAPI parent so we can add a plain /health for
+# the kubelet readinessProbe (the MCP endpoint requires proper handshake).
+
+app = FastAPI(title="AIMS MCP reference stub", version="0.1.0")
+
+
 @app.get("/health")
-async def health() -> Dict[str, str]:
+def health() -> Dict[str, str]:
     return {"status": "healthy", "service": "mcp-stub"}
 
 
-@app.post("/mcp/tools/call")
-async def tools_call(request: Request) -> Dict[str, Any]:
-    body = await request.json()
-    method = body.get("method")
-    params = body.get("params") or {}
-    tool_name = params.get("name")
-    args = params.get("arguments") or {}
-    call_id = body.get("id") or "stub-call"
-
-    logger.info("tool_call name=%s method=%s id=%s", tool_name, method, call_id)
-
-    if method != "tools/call":
-        raise HTTPException(status_code=400, detail=f"unsupported method: {method}")
-
-    if tool_name == "aims_discover_capabilities":
-        return _wrap_result(DISCOVER_RESPONSE, call_id)
-
-    if tool_name == "aims_propose_resolution":
-        return _wrap_result(_propose_response(args), call_id)
-
-    raise HTTPException(status_code=400, detail=f"unknown tool: {tool_name}")
+# MCP mount — the router's endpoint_url should be
+#   http://mcp-stub.mcp.svc.cluster.local:9000/mcp/
+# with the trailing slash. Bare /mcp responds 307 to /mcp/ by design.
+app.mount("/mcp", mcp.streamable_http_app())

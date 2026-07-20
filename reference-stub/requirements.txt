@@ -1,2 +1,7 @@
 fastapi==0.115.2
 uvicorn[standard]==0.31.1
+# Spec-compliant streamable-HTTP MCP server. Handles initialize handshake,
+# Mcp-Session-Id, SSE-per-response — the things a bespoke JSON endpoint
+# doesn't do and that make a "real" MCP server addressable by real MCP
+# clients (mcp SDK, Claude Desktop, etc).
+fastmcp>=0.4.0,<1.0.0

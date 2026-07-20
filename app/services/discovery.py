@@ -1,24 +1,32 @@
 """Call the MCP server's aims_discover_capabilities on registration.
 
-Failures raise DiscoveryError; caller (api/apps.py) surfaces as HTTP 400 with
-a clear explanation. We DO NOT persist a server whose discovery is unreachable
-— avoids "registered but broken" entries silently rotting.
+We interview the server *before* persisting the registration — a server
+that can't answer discovery is rejected here, not silently persisted.
 
-Auth: if the registered server declares auth_type=bearer with a KV auth_ref,
-we resolve the KV secret and attach it. For any other auth_type we make the
-discovery call unauthenticated (servers implementing their own auth on a
-subset of tools should still let aims_discover_capabilities through — it's a
-prerequisite for onboarding).
+Uses the official MCP client SDK via ``mcp_client.call_tool_sync`` — a
+real streamable-HTTP client that does the initialize handshake, tracks the
+session id, and parses SSE-per-response frames. Bespoke HTTP against
+``/tools/call`` isn't spec-compliant and breaks on real MCP servers (they
+return ``406 Missing session ID`` — see the trading-ui-mcp registration
+notes in docs/contracts.md §5).
+
+Auth: if the registered server declares auth_type=bearer with a KV
+auth_ref, we resolve the KV secret via the CSI mount and pass it as a
+header on every request in the MCP session. Any auth_type without a
+usable ``auth_ref`` calls discovery unauthenticated — servers requiring
+auth on discovery should return 401, which surfaces here as a clear
+"secret not mounted; add to keyvault-mcp-router SPC" error.
 """
+
+from __future__ import annotations
 
 import logging
 import re
 from typing import Optional
 
-import httpx
-
 from app.config import settings
 from app.schemas.mcp_server import DiscoveryResponse
+from app.services import mcp_client
 
 logger = logging.getLogger(__name__)
 
@@ -81,53 +89,34 @@ def _attach_auth(headers: dict, auth_type: str, auth_ref: Optional[str]) -> None
 
 
 def call_discover(endpoint_url: str, auth_type: str, auth_ref: Optional[str]) -> DiscoveryResponse:
-    """POST tools/call aims_discover_capabilities against a server."""
-    headers = {"Content-Type": "application/json"}
+    """Real MCP client call to aims_discover_capabilities. Sync wrapper —
+    the MCP SDK is async but the FastAPI handler is sync."""
+    headers: dict = {}
     _attach_auth(headers, auth_type, auth_ref)
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": "discover-registration",
-        "method": "tools/call",
-        "params": {"name": "aims_discover_capabilities", "arguments": {}},
-    }
-
     timeout_s = settings.DISCOVERY_TIMEOUT_MS / 1000.0
-    try:
-        with httpx.Client(timeout=timeout_s, follow_redirects=False) as client:
-            resp = client.post(f"{endpoint_url.rstrip('/')}/tools/call", json=payload, headers=headers)
-    except httpx.HTTPError as exc:
-        raise DiscoveryError(f"unreachable ({type(exc).__name__}: {exc})") from exc
 
-    if resp.status_code == 401:
-        raise DiscoveryError(
-            "server returned 401 to discovery — auth_ref may be wrong or not mounted"
+    try:
+        payload = mcp_client.call_tool_sync(
+            endpoint_url=endpoint_url,
+            tool_name="aims_discover_capabilities",
+            arguments={},
+            headers=headers,
+            timeout_s=timeout_s,
         )
-    if resp.status_code >= 400:
-        raise DiscoveryError(f"HTTP {resp.status_code} from discovery: {resp.text[:200]}")
+    except mcp_client.MCPCallError as exc:
+        msg = str(exc)
+        # Common 401 shape from the SDK: "HTTP 401" or "Unauthorized" in
+        # the transport error. Map to the actionable "check KV" message.
+        if "401" in msg or "Unauthorized" in msg:
+            raise DiscoveryError(
+                f"server returned 401 to discovery — auth_ref may be wrong or the "
+                f"KV secret isn't mounted at /mnt/secrets/<name>. Details: {msg}"
+            ) from exc
+        raise DiscoveryError(f"MCP discovery call failed: {msg}") from exc
 
     try:
-        body = resp.json()
-    except ValueError as exc:
-        raise DiscoveryError(f"non-JSON response body: {exc}") from exc
-
-    # MCP JSON-RPC wraps the tool result under `result.content` (spec) or
-    # `result` directly (permissive). Try both.
-    result = body.get("result")
-    if isinstance(result, dict) and "content" in result:
-        # Spec-compliant: content is a list of {type: "text", text: "<json>"}
-        content = result["content"]
-        if isinstance(content, list) and content and content[0].get("type") == "text":
-            import json as _json
-            try:
-                result = _json.loads(content[0]["text"])
-            except (ValueError, KeyError) as exc:
-                raise DiscoveryError(f"result.content[0].text not valid JSON: {exc}") from exc
-    if not isinstance(result, dict):
-        raise DiscoveryError(f"unexpected response shape: keys={list(body.keys())}")
-
-    try:
-        discovery = DiscoveryResponse.model_validate(result)
+        discovery = DiscoveryResponse.model_validate(payload)
     except Exception as exc:
         raise DiscoveryError(f"discovery payload failed validation: {exc}") from exc
 
@@ -137,4 +126,12 @@ def call_discover(endpoint_url: str, auth_type: str, auth_ref: Optional[str]) ->
             f"(this router speaks {sorted(SUPPORTED_PROTOCOL_VERSIONS)})"
         )
 
+    logger.info(
+        "discovery_ok endpoint=%s server=%s protocol=%s handles_severities=%s handles_alerts=%s",
+        endpoint_url,
+        discovery.server_name,
+        discovery.protocol_version,
+        discovery.handles.severities,
+        discovery.handles.alert_types,
+    )
     return discovery

@@ -8,3 +8,7 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 httpx==0.27.2
 pyjwt==2.9.0
+# Official MCP client SDK — real streamable-HTTP client (initialize
+# handshake, Mcp-Session-Id tracking, SSE-per-response parsing). Bespoke
+# httpx.post against /tools/call breaks on spec-compliant servers.
+mcp>=1.2.0,<2.0.0

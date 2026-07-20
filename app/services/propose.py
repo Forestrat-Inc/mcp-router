@@ -5,13 +5,18 @@ doesn't need to mount every MCP server's KV secret. Every capability
 short-circuit — severity, alert_type match against the server's
 declared handles — happens here too, so we surface 204 to the agent
 when the server exists but doesn't want this incident.
+
+Uses the official MCP client SDK via ``mcp_client.call_tool_sync`` — a
+real streamable-HTTP client that does the initialize handshake and parses
+SSE-per-response frames. Bespoke HTTP against ``/tools/call`` breaks on
+real MCP servers (they return ``406 Missing session ID``).
 """
+
+from __future__ import annotations
 
 import logging
 import re
 from typing import Optional
-
-import httpx
 
 from app.config import settings
 from app.models import MCPServer
@@ -20,6 +25,7 @@ from app.schemas.mcp_server import (
     ProposeRequest,
     ProposeResponse,
 )
+from app.services import mcp_client
 from app.services.discovery import _attach_auth
 
 logger = logging.getLogger(__name__)
@@ -62,7 +68,8 @@ def _capability_match(handles: DiscoveryHandles, req: ProposeRequest) -> tuple[b
 
 
 def forward_propose(server: MCPServer, req: ProposeRequest) -> Optional[ProposeResponse]:
-    """POST tools/call aims_propose_resolution to the registered server.
+    """Real MCP client call to aims_propose_resolution. Sync wrapper —
+    the MCP SDK is async but the FastAPI handler is sync.
 
     Returns:
       - a validated ProposeResponse on success
@@ -77,7 +84,7 @@ def forward_propose(server: MCPServer, req: ProposeRequest) -> Optional[ProposeR
             f"server {server.name!r} does not handle this incident: {'; '.join(misses)}"
         )
 
-    headers = {"Content-Type": "application/json"}
+    headers: dict = {}
     _attach_auth(headers, server.auth_type, server.auth_ref)
 
     # Cap the timeout at the router's global setting; server can go lower via
@@ -85,57 +92,39 @@ def forward_propose(server: MCPServer, req: ProposeRequest) -> Optional[ProposeR
     server_ms = int(caps.get("max_response_ms") or settings.RESOLUTION_CALL_TIMEOUT_MS)
     timeout_s = min(server_ms, settings.RESOLUTION_CALL_TIMEOUT_MS) / 1000.0
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": req.constraints.correlation_id or "propose",
-        "method": "tools/call",
-        "params": {
-            "name": "aims_propose_resolution",
-            "arguments": req.model_dump(mode="json"),
-        },
-    }
-
-    endpoint = f"{server.endpoint_url.rstrip('/')}/tools/call"
     try:
-        with httpx.Client(timeout=timeout_s, follow_redirects=False) as client:
-            resp = client.post(endpoint, json=payload, headers=headers)
-    except httpx.HTTPError as exc:
-        raise ProposeError(f"transport error: {type(exc).__name__}: {exc}") from exc
-
-    if resp.status_code >= 500:
-        raise ProposeError(f"HTTP {resp.status_code} from server: {resp.text[:300]}")
-    if resp.status_code == 401:
-        raise ProposeError(
-            "server returned 401 — auth_ref may be wrong or the KV secret isn't mounted"
+        payload = mcp_client.call_tool_sync(
+            endpoint_url=server.endpoint_url,
+            tool_name="aims_propose_resolution",
+            arguments=req.model_dump(mode="json"),
+            headers=headers,
+            timeout_s=timeout_s,
         )
-    if resp.status_code >= 400:
-        raise ProposeError(f"HTTP {resp.status_code} from server: {resp.text[:300]}")
+    except mcp_client.MCPCallError as exc:
+        msg = str(exc)
+        if "401" in msg or "Unauthorized" in msg:
+            raise ProposeError(
+                f"server returned 401 — auth_ref may be wrong or the KV secret isn't "
+                f"mounted at /mnt/secrets/<name>. Details: {msg}"
+            ) from exc
+        raise ProposeError(f"MCP propose call failed: {msg}") from exc
+
+    # server_name isn't guaranteed to be in the tool response — inject from
+    # the registration snapshot so the agent-side rendering always has a
+    # display name.
+    payload.setdefault("server_name", server.name)
 
     try:
-        body = resp.json()
-    except ValueError as exc:
-        raise ProposeError(f"non-JSON body: {exc}") from exc
-
-    # Spec: result.content[0].text is JSON-encoded string. Permissive: result
-    # may be the parsed object directly. Same shape handling as discovery.
-    result = body.get("result")
-    if isinstance(result, dict) and "content" in result:
-        content = result["content"]
-        if isinstance(content, list) and content and content[0].get("type") == "text":
-            import json as _json
-            try:
-                result = _json.loads(content[0]["text"])
-            except (ValueError, KeyError) as exc:
-                raise ProposeError(f"result.content[0].text invalid JSON: {exc}") from exc
-
-    if not isinstance(result, dict):
-        raise ProposeError(f"unexpected response shape (keys={list(body.keys())})")
-
-    # server_name isn't in the tool response — inject from the registration
-    # snapshot so the agent-side rendering always has a display name.
-    result.setdefault("server_name", server.name)
-
-    try:
-        return ProposeResponse.model_validate(result)
+        response = ProposeResponse.model_validate(payload)
     except Exception as exc:
         raise ProposeError(f"response failed validation: {exc}") from exc
+
+    logger.info(
+        "propose_ok server=%s incident=%s confidence=%.2f actions=%d unable=%s",
+        server.name,
+        req.incident.id,
+        response.confidence,
+        len(response.recommended_actions),
+        response.unable_to_diagnose,
+    )
+    return response
