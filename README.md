@@ -1,33 +1,26 @@
 # mcp-router
 
-> Standalone `application_id → MCP server` registry. Not tied to any
-> particular caller. Any system with authenticated clients can register
-> MCP servers, look them up, and delegate `aims_propose_resolution` calls
-> through the router so the target server's auth stays server-side.
+> Standalone `application_id → MCP server` **service-discovery / KV registry**.
+> Consumers register MCP servers with an application id, look them up, then
+> call the target MCP server themselves via the streamable-HTTP `mcp` SDK.
+> The router does NOT proxy tool calls — it's a pure CRUD/lookup service.
 >
-> This directory is **self-contained**. It has its own Dockerfile,
-> Alembic chain, K8s manifests, CI workflow, and dependency file. It
-> currently lives in the AIMS monorepo alongside the AIMS agent (the
-> first caller), but it is deliberately built to `git subtree split`
-> into its own repo whenever the operator wants.
+> This is its own repo. Own Dockerfile, own Alembic chain, own K8s
+> manifests, own CI workflow, own dependency file. AIMS is one caller
+> among potentially many.
 
 ## What it does
 
 - Stores a `mcp_server` record per `application_id` (Postgres, schema `mcp_router`).
-- Validates registrations by calling the target server's
-  `aims_discover_capabilities` synchronously — unreachable / bad
-  `protocol_version` / write-capable-not-acknowledged all refuse the
-  registration with `400` (never persist a broken record).
-- Serves `POST /api/mcp/apps/{application_id}/propose` — the agent calls
-  this once per resolve, router forwards to the target server's
-  `tools/call aims_propose_resolution` with server-side-resolved auth
-  (Key Vault, per registration).
-- Cache-aside on Redis with a 5-min TTL.
+- Serves `GET /api/mcp/apps/{application_id}` for consumers to resolve the
+  registered `endpoint_url` + `auth_type` + `auth_ref` + capabilities snapshot.
+- Cache-aside on Redis with a 5-min TTL for the read path.
 - Audit shadow table (`mcp_server_history`) captures every INSERT /
   UPDATE / DELETE with before + after JSON snapshots.
+- **Never talks to a target MCP server itself.** Consumers do that.
 
-Contract every registered MCP server must implement:
-[`../docs/mcp-router/contracts.md`](../docs/mcp-router/contracts.md).
+Contract every registered MCP server must implement (target-server side):
+[`docs/contracts.md`](docs/contracts.md).
 
 ## Auth (router-owned, not tied to any caller's identity system)
 
@@ -53,20 +46,21 @@ apps (never `403`, to avoid existence-leak).
 | `POST`   | `/api/mcp/apps`                                 | admin  |
 | `PATCH`  | `/api/mcp/apps/{application_id}`                | admin  |
 | `DELETE` | `/api/mcp/apps/{application_id}`                | admin (soft-delete → status='deprecated') |
-| `POST`   | `/api/mcp/apps/{application_id}/propose`        | reader — forwards to the target MCP server |
 | `POST`   | `/api/mcp/admin/invalidate/{application_id}`    | admin |
 | `GET`    | `/api/mcp/admin/history/{application_id}`       | admin |
 | `GET`    | `/health`, `/ready`                             | none  |
 
-Response codes for `/propose`:
-- **200** — proposal returned by the target server
-- **204** — server exists but its `handles` (declared capabilities) don't match this incident
+Response codes for `GET /apps/{id}`:
+- **200** — record returned (endpoint, auth, capabilities snapshot)
 - **404** — no active server registered for this `application_id`
-- **502** — target server errored or returned an unparseable payload
 
-The AIMS agent maps every non-200 to a fail-soft `None`, so
-Resolve-with-AI never breaks because the router or target server had a
-bad day.
+Consumers of the API (aims-agent today) map 404 / transport failures to a
+fail-soft skip, so their feature (Resolve-with-AI) never breaks because
+the router or target server had a bad day. The actual MCP call —
+`initialize` + `session.call_tool("aims_propose_resolution", ...)` —
+happens inside the consumer using the streamable-HTTP `mcp` SDK against
+the target's `endpoint_url`, with a bearer/api_key resolved from a
+CSI-mounted KV secret named by `auth_ref`.
 
 ## Local dev
 

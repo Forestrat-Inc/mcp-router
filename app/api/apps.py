@@ -1,4 +1,17 @@
-"""CRUD for MCP server registrations."""
+"""CRUD for MCP server registrations.
+
+The router is a pure service-discovery / KV registry — it stores the
+(application_id → {endpoint_url, auth_type, auth_ref, capabilities}) map
+and nothing more. Consumers GET a registration, resolve the target's
+auth_ref from their OWN KV secret mount, and make the MCP tool call
+themselves via the mcp SDK. The router does NOT proxy tool calls; there
+is no runtime coupling between it and target MCP servers.
+
+That simplification is deliberate — see docs/contracts.md §1 for the
+consumer contract and the tradeoff (every consumer needs the mcp SDK
+and each target-server bearer mounted, but the router itself is a
+2-endpoint CRUD service).
+"""
 
 import logging
 from datetime import datetime, timezone
@@ -15,13 +28,9 @@ from app.schemas.mcp_server import (
     MCPServerCreate,
     MCPServerResponse,
     MCPServerUpdate,
-    ProposeRequest,
-    ProposeResponse,
 )
 from app.services import cache
 from app.services.audit import audit
-from app.services.discovery import DiscoveryError, call_discover
-from app.services.propose import CapabilityMissError, ProposeError, forward_propose
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -69,7 +78,12 @@ def get_app(
     application_id: UUID,
     principal: Principal = Depends(get_current_principal),
 ) -> MCPServerResponse:
-    """Cache-aside lookup. 404 for unknown OR non-active-to-non-admin."""
+    """Cache-aside lookup. 404 for unknown OR non-active-to-non-admin.
+
+    This is THE hot path — every Resolve-with-AI turn on every consumer
+    hits this endpoint. Kept cache-first to make it a single Redis read
+    on the happy path.
+    """
     cached = cache.get_cached(application_id)
     if cached is not None:
         if cached.get("status") == "active" or principal.is_admin:
@@ -90,28 +104,14 @@ def create_app(
     body: MCPServerCreate,
     principal: Principal = Depends(require_admin),
 ) -> MCPServerResponse:
-    """Register an MCP server. Calls discovery synchronously — a server that
-    can't answer discovery is rejected here, not silently persisted."""
+    """Register an MCP server. Pure KV store — no discovery call.
 
-    # Interview the server BEFORE we persist anything.
-    try:
-        discovery = call_discover(body.endpoint_url, body.auth_type, body.auth_ref)
-    except DiscoveryError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"MCP discovery failed: {exc}",
-        )
-
-    if not discovery.read_only_default and not body.i_accept_write_capable_server:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Server declares read_only_default=false. Set "
-                "'i_accept_write_capable_server': true in the request body if "
-                "you intend to register a write-capable server."
-            ),
-        )
-
+    The optional ``capabilities`` field on the request body carries the
+    caller-supplied capability declaration (severities the server handles,
+    declared actions, etc.). Consumers may use it as a hint or ignore it
+    and query the target's ``aims_discover_capabilities`` tool themselves
+    at consumption time. The router NEVER interviews the target.
+    """
     now = datetime.now(timezone.utc)
     with session_scope() as db:
         existing = db.get(MCPServer, body.application_id)
@@ -127,7 +127,7 @@ def create_app(
             endpoint_url=body.endpoint_url,
             auth_type=body.auth_type,
             auth_ref=body.auth_ref,
-            capabilities_snapshot=discovery.model_dump(),
+            capabilities_snapshot=body.capabilities or {},
             server_metadata=body.server_metadata,
             status=body.status,
             owner_email=body.owner_email,
@@ -137,7 +137,7 @@ def create_app(
         )
         db.add(server)
         audit(db, body.application_id, "insert", None, server, principal.sub)
-        db.flush()  # populate defaults before snapshot
+        db.flush()
         cache.set_cached(body.application_id, _to_cache(server))
         logger.info(
             "mcp_server registered app_id=%s name=%s endpoint=%s by=%s",
@@ -155,95 +155,33 @@ def patch_app(
     body: MCPServerUpdate,
     principal: Principal = Depends(require_admin),
 ) -> MCPServerResponse:
-    """Partial update. If endpoint_url or auth changes, we re-discover to
-    catch stale registrations early."""
+    """Partial update. Pure KV store — no re-discovery call.
+
+    If the caller wants to refresh the capabilities snapshot, they include
+    it in the PATCH body (usually after re-interviewing the target
+    themselves).
+    """
     with session_scope() as db:
         server = db.get(MCPServer, application_id)
         if server is None:
             raise HTTPException(status_code=404, detail="Not found")
 
-        # Snapshot before mutation for the audit row.
         before = MCPServer(**{c.name: getattr(server, c.name) for c in MCPServer.__table__.columns})
 
         changed = body.model_dump(exclude_unset=True, by_alias=True)
+        # Alias-mapped fields need to write to the ORM column name.
         if "metadata" in changed:
             server.server_metadata = changed.pop("metadata")
+        if "capabilities" in changed:
+            server.capabilities_snapshot = changed.pop("capabilities")
         for k, v in changed.items():
             setattr(server, k, v)
-
-        # If the endpoint or auth changed, re-discover — a broken update
-        # should fail loudly, not silently persist.
-        if any(k in changed for k in ("endpoint_url", "auth_type", "auth_ref")):
-            try:
-                discovery = call_discover(server.endpoint_url, server.auth_type, server.auth_ref)
-                server.capabilities_snapshot = discovery.model_dump()
-                if not discovery.read_only_default:
-                    logger.warning(
-                        "server %s declares read_only_default=false via PATCH; grandfathered in",
-                        application_id,
-                    )
-            except DiscoveryError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MCP re-discovery failed after PATCH: {exc}",
-                )
 
         server.updated_at = datetime.now(timezone.utc)
         server.updated_by = principal.sub
         audit(db, application_id, "update", before, server, principal.sub)
         cache.invalidate(application_id)
         return _to_response(server)
-
-
-@router.post("/{application_id}/propose", response_model=Optional[ProposeResponse])
-def propose_via(
-    application_id: UUID,
-    body: ProposeRequest,
-    principal: Principal = Depends(get_current_principal),
-    response=None,
-) -> Optional[ProposeResponse]:
-    """Forward an aims_propose_resolution call to the registered server.
-
-    Response codes:
-      200 — proposal returned by the server
-      204 — server exists but its declared handles don't match this incident
-      404 — no active server registered for this application
-      502 — server errored or returned an unparseable payload
-    """
-    from fastapi import Response
-    from fastapi.responses import JSONResponse
-
-    # Try cache first for the lookup — avoids a PG hit per propose.
-    cached = cache.get_cached(application_id)
-    server: Optional[MCPServer] = None
-    if cached is not None and cached.get("status") == "active":
-        with session_scope() as db:
-            server = db.get(MCPServer, application_id)
-    else:
-        with session_scope() as db:
-            server = db.get(MCPServer, application_id)
-
-    if server is None or server.status != "active":
-        raise HTTPException(status_code=404, detail="No active MCP server for this application")
-
-    logger.info(
-        "propose forward app_id=%s server=%s by=%s corr=%s",
-        application_id,
-        server.name,
-        principal.sub,
-        body.constraints.correlation_id,
-    )
-
-    try:
-        proposal = forward_propose(server, body)
-    except CapabilityMissError as exc:
-        logger.info("propose 204 app_id=%s reason=%s", application_id, exc)
-        return JSONResponse(status_code=204, content=None)
-    except ProposeError as exc:
-        logger.warning("propose 502 app_id=%s err=%s", application_id, exc)
-        raise HTTPException(status_code=502, detail=f"MCP server error: {exc}")
-
-    return proposal
 
 
 @router.delete("/{application_id}", status_code=204)
