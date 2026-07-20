@@ -4,4 +4,6 @@ uvicorn[standard]==0.31.1
 # Mcp-Session-Id, SSE-per-response — the things a bespoke JSON endpoint
 # doesn't do and that make a "real" MCP server addressable by real MCP
 # clients (mcp SDK, Claude Desktop, etc).
-fastmcp>=0.4.0,<1.0.0
+# NB: fastmcp had two lineages — the old anthropic <=0.4.x (SSE + stdio
+# only) and jlowin's 2.x+ (adds streamable-HTTP). We need the latter.
+fastmcp>=2.9.0,<4.0.0

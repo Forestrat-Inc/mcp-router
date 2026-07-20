@@ -154,9 +154,22 @@ def aims_propose_resolution(
 # ── HTTP surface ────────────────────────────────────────────────────────
 # fastmcp gives us a Starlette app for the streamable-HTTP MCP endpoint.
 # We front it with a tiny FastAPI parent so we can add a plain /health for
-# the kubelet readinessProbe (the MCP endpoint requires proper handshake).
+# the kubelet readinessProbe (the MCP endpoint itself needs a full MCP
+# handshake and won't answer a bare GET).
+#
+# Lifespan gotcha: fastmcp's streamable_http_app() has its own lifespan
+# (task groups, session manager). Mounting a sub-app does NOT run its
+# lifespan by default — we have to propagate it to the parent's lifespan
+# or the MCP endpoint 500s on the first request with "task group not
+# initialised." Call streamable_http_app() ONCE and reuse.
 
-app = FastAPI(title="AIMS MCP reference stub", version="0.1.0")
+_mcp_asgi_app = mcp.streamable_http_app()
+
+app = FastAPI(
+    title="AIMS MCP reference stub",
+    version="0.1.0",
+    lifespan=_mcp_asgi_app.router.lifespan_context,
+)
 
 
 @app.get("/health")
@@ -167,4 +180,4 @@ def health() -> Dict[str, str]:
 # MCP mount — the router's endpoint_url should be
 #   http://mcp-stub.mcp.svc.cluster.local:9000/mcp/
 # with the trailing slash. Bare /mcp responds 307 to /mcp/ by design.
-app.mount("/mcp", mcp.streamable_http_app())
+app.mount("/mcp", _mcp_asgi_app)
