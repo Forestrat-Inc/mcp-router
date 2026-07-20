@@ -15,33 +15,54 @@
 
 ## 1. The 30-second mental model
 
+**mcp-router is a service-discovery / KV registry.** It stores the
+`application_id → {endpoint_url, auth_type, auth_ref, capabilities}` map
+and nothing more. It does NOT proxy tool calls.
+
+Every consumer (today: aims-agent) does its own MCP client work:
+
 ```
   User clicks "Resolve with AI" on incident I in application A
       │
       ▼
-  agent-service                           mcp-router                     application A's MCP server
+  consumer (e.g. aims-agent)             mcp-router                     application A's MCP server
   ┌──────────────────────┐    (1) GET   ┌──────────────────┐             ┌─────────────────────────┐
   │ context digest       │ ────────────►│ /apps/{A}        │             │ tools/list              │
   │  · incident I        │              │ → {endpoint,     │             │  aims_discover_…        │
-  │  · similar past      │              │    auth_ref,     │             │  aims_propose_res…      │
-  │    incidents from KG │              │    capabilities} │             │  aims_execute_action?   │
-  │  · runbooks          │              └──────────────────┘             └─────────────────────────┘
-  └──────────┬───────────┘                                                          ▲
+  │  · similar past      │              │    auth_type,    │             │  aims_propose_res…      │
+  │    incidents from KG │              │    auth_ref,     │             │  aims_execute_action?   │
+  │  · runbooks          │              │    capabilities} │             │                         │
+  └──────────┬───────────┘              └──────────────────┘             └─────────────────────────┘
+             │                                                                      ▲
+             │ (2) read the target's bearer from CSI mount at                       │
+             │     /mnt/secrets/<name> (auth_ref is kv://…/<name>)                  │
              │                                                                      │
-             │ (2) if capabilities match this incident, invoke                       │
+             │ (3) open a streamable-HTTP MCP session with the mcp SDK,             │
+             │     initialize, then invoke:                                         │
              └──────────────────────────────────────────────────────────────────────┘
                      aims_propose_resolution({ incident, context, constraints })
              ◄──────────────────────────────────────────────────────────────────────
                      { confidence, analysis, recommended_actions[], ... }
                                                         │
                                                         ▼
-                                       Merged into agent's LangGraph context
+                                       Merged into consumer's LLM context
                                        LLM writes final resolution using both
                                        the KG-derived past incidents AND the
                                        application-owned MCP proposal.
 ```
 
-The contract is small on purpose: **discovery + one required tool + one optional tool**. If a team wants to expose more (metrics readers, log tailers, whatever), they use standard MCP `tools/list` — the agent will surface those to the LLM naturally. But the two AIMS-specific tools below are the load-bearing bits AIMS itself calls deterministically.
+**Tradeoff being accepted with this design.** Every consumer needs the
+`mcp` SDK, every target-server bearer mounted in the consumer's KV SPC,
+and its own init/session code. In exchange the router is a 2-endpoint
+CRUD service with zero runtime coupling to the targets. We picked this
+when the consumer count was 1; if it grows, revisit.
+
+The contract with target servers is small on purpose: **discovery + one
+required tool + one optional tool**. If a team wants to expose more
+(metrics readers, log tailers, whatever), they use standard MCP
+`tools/list` — consumers may surface those to their LLM naturally. But
+the two AIMS-specific tools below are the load-bearing bits consumers
+call deterministically.
 
 ---
 
@@ -83,7 +104,7 @@ Field notes:
 - **`max_response_ms`**: server's own SLA. AIMS will use this as its call timeout, capped at 60000 ms.
 - **`read_only_default: true`** means the server promises `aims_propose_resolution` alone never causes side effects. Setting it to `false` requires the AIMS operator to opt in when registering the server (see §7).
 
-The router **caches this response for 5 minutes** per `application_id`. Servers that need to hot-reload their capabilities should call `POST https://aims-az.forestrat.ai/api/mcp/admin/invalidate/{application_id}` after any change.
+The router NEVER calls this — it's part of the target-server contract that **consumers** interpret. The router stores whatever `capabilities` the caller supplied at register time (usually a snapshot the caller took by interviewing the target itself). Consumers should re-query `aims_discover_capabilities` on their own cadence and PATCH the registration to refresh the snapshot when the target's capabilities change.
 
 ---
 
@@ -262,32 +283,42 @@ Field notes:
 
 ---
 
-## 3. Discovery + registration flow
+## 3. Registration flow
 
 Team X wants their application to be resolvable by AIMS:
 
-1. Team X **builds their MCP server** implementing the three tools above. Deployed anywhere reachable (their own cluster, ours, external).
-2. Team X **registers** with the AIMS mcp-router (ADMIN-gated):
+1. **Team X builds their MCP server** implementing the tools above (streamable-HTTP; see §4). Deployed anywhere reachable by the consumers (typically in the same AKS cluster as aims-agent).
+
+2. **Team X (or router-admin) puts the bearer token in KV** at `forestrat-kv/<name>` — team-owned convention, e.g. `agent-service-mcp-router-token` if aims-agent is the consumer.
+
+3. **Router-admin adds the KV secret to each consumer's SPC.** For aims-agent that's `backend/aims-agent-service/k8s/secretproviderclass.yaml`. Force CSI refresh after the deploy so the new mount appears (`kubectl -n aims delete secret aims-agent-secrets && kubectl -n aims rollout restart deployment/aims-agent`).
+
+4. **Register with the mcp-router** (X-API-Key admin, or router-admin JWT):
 
 ```bash
 POST https://aims-az.forestrat.ai/api/mcp/apps
-Authorization: Bearer $AIMS_ADMIN_TOKEN
+X-API-Key: $MCP_ADMIN_KEY
 Content-Type: application/json
 
 {
   "application_id": "59de013d-8cdf-44e0-89a1-dfad8c325d39",
-  "name": "trading-ui-resolver",
-  "transport": "http",
-  "endpoint_url": "https://mcp-trading.internal.forestrat.ai/mcp",
-  "auth_type": "bearer",
-  "auth_ref": "kv://forestrat-kv/trading-ui-mcp-token",
-  "owner_email": "trading-ui-team@forestrat.ai",
-  "status": "active"
+  "name":           "trading-ui-mcp",
+  "transport":      "http",
+  "endpoint_url":   "http://tradeui-mcp.trade-ui.svc.cluster.local:3000/mcp/",
+  "auth_type":      "bearer",
+  "auth_ref":       "kv://forestrat-kv/agent-service-mcp-router-token",
+  "owner_email":    "trading-ui-team@forestrat.ai",
+  "status":         "active",
+  "capabilities":   {                            // optional; snapshot from
+    "protocol_version": "1",                    //  aims_discover_capabilities
+    "server_name": "trading-ui-mcp",             //  the caller took itself
+    "handles": { "severities": ["P1","P2"] },
+    "declared_actions": [ ... ]
+  }
 }
 ```
 
-3. The router **calls `aims_discover_capabilities` immediately** at registration time. If it fails or returns an unrecognized `protocol_version`, the registration is `400`d — the record is not persisted.
-4. The router **caches** the discovery response (5-min TTL) and stores a snapshot in `mcp_server.capabilities_snapshot` for auditability. Refetch is transparent.
+**The router does NOT interview the target** — it's a pure KV store. If the caller wants the target's capabilities in the record (for consumer hints, UI display, or auditability), the caller does the `aims_discover_capabilities` call themselves and includes the payload in the `capabilities` field. Otherwise omit and pass `{}`.
 
 Registration is per-application, not per-instance. If Trading UI dev/staging/prod need different MCP servers, use environment-specific `application_id`s (which you'd get by creating separate applications in the AIMS registry per env).
 
@@ -295,7 +326,7 @@ Registration is per-application, not per-instance. If Trading UI dev/staging/pro
 
 ## 4. Transport
 
-**Streamable-HTTP MCP is the only supported transport.** This is the modern MCP network transport (spec revision `2025-03-26`). The router uses the official Python MCP client SDK (`mcp>=1.2.0`) — servers should be built with `fastmcp`, the reference `mcp-python` server, the TypeScript `@modelcontextprotocol/sdk`, or any other streamable-HTTP MCP implementation.
+**Streamable-HTTP MCP is the recommended transport.** This is the modern MCP network transport (spec revision `2025-03-26`). Consumers use the official Python MCP client SDK (`mcp>=1.2.0`) — servers should be built with `fastmcp`, the reference `mcp-python` server, the TypeScript `@modelcontextprotocol/sdk`, or any other streamable-HTTP MCP implementation. The router itself doesn't call the target so it doesn't care what transport you use in principle, but every consumer today uses the streamable-HTTP SDK.
 
 Not stdio (subprocess only; wrong network model). Not classic SSE (deprecated by the spec; two-endpoint dance + persistent connection fights AKS ingress). Not WebSocket (never in the MCP spec).
 
@@ -336,16 +367,18 @@ We may later add per-application auto-approval policies (e.g. "diagnostic action
 
 ## 6. Auth
 
-- **AIMS → MCP server**: AIMS passes the token retrieved from KV via `auth_ref`. Auth header is `Authorization: Bearer <token>`. Rotation is on the team's side — rotate the KV secret, no AIMS restart needed (SPC picks up on next call... though see the CSI-secret-refresh gotcha in the AKS operator runbook (whichever runbook lives in the deployment repo — Forestrat AIMS has one in `docs/azure/architecture.md § 11`), may need a router pod restart in practice until CSI Secret Store's mirror-refresh limitation is worked around).
-- **MCP server → AIMS callbacks**: none in v1. The MCP server does not make outbound calls to AIMS. If a server needs to look up more incident context, that's a v2 feature (`aims_fetch_incident_context(id)`).
+- **Consumer → MCP server**: Consumers (e.g. aims-agent) read the token from a CSI-mounted KV secret at `/mnt/secrets/<name>` where `<name>` is the last segment of the `auth_ref` URI. Auth header is `Authorization: Bearer <token>` (bearer) or `X-API-Key: <token>` (api_key). Rotation is on the team's side — rotate the KV secret, then the consumer pod restarts (or CSI Secret Store mirror-refresh; note the AKS-limitation gotcha in the deployment runbook).
+- **Router auth is separate**: the mcp-router accepts an X-API-Key from consumers making registry lookups. That key (`agent-mcp-router-api-key` for aims-agent) is unrelated to any target-server bearer.
+- **MCP server → consumer callbacks**: none in v1. The MCP server does not make outbound calls back. If a server needs to look up more incident context, that's a v2 feature (`aims_fetch_incident_context(id)`).
 - **JWT `sub` propagation on `aims_execute_action`**: the user who clicked the confirm button appears in `approval.confirmed_by`. Servers should log this for audit trail.
 
 ---
 
 ## 7. Registration semantics — `read_only_default`
 
-- Servers declaring `read_only_default: true` (the default) can be registered by any AIMS ADMIN without extra ceremony.
-- Servers declaring `read_only_default: false` require the registration payload to include `"i_accept_write_capable_server": true` — a small ergonomic guardrail so "write-capable" doesn't slip in unnoticed. Documented as a footgun in the API reference.
+The router doesn't interview targets anymore, so it can't enforce `read_only_default` at register time. **Responsibility moved to the consumer.** aims-agent's system prompt forbids the LLM from executing any recommended action during propose (§9 below). If a new consumer is added and it wants to execute writes, the guardrails against write-capable servers live on that consumer's side.
+
+Servers should still declare `read_only_default: true` in their discovery response — it's a hint to future consumers and appears in the registered `capabilities` snapshot for UI display + auditability.
 
 ---
 
