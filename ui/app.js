@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * mcp-router config UI — single-page vanilla JS. Every state transition
+ * MCP Registry Service UI — single-page vanilla JS. Every state transition
  * is explicit; no reactive framework. Auth is an X-API-Key kept in
  * sessionStorage. On 401 we clear it and fall back to the sign-in card.
  */
