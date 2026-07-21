@@ -10,6 +10,7 @@ on:
       - "app/**"
       - "alembic/**"
       - "reference-stub/**"
+      - "ui/**"                  # StaticFiles mount on app.main; edits need a rebuild
       - "k8s/**"
       - "Dockerfile"
       - "requirements.txt"
