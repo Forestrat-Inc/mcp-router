@@ -173,6 +173,8 @@ Field notes:
 
 - **`incident.metadata`** is the source-registered event payload verbatim (from rule-engine's field_schema). Servers should reach for their own domain-specific fields there.
 - **`context.similar_past_incidents`** is populated from the ontology graph via `search_similar` (multi-vector KNN over symptom + resolution embeddings). Top 5 by `similarity_score`. Empty array if the graph has nothing similar — always treat empty as "no signal", not "error".
+  - **`similarity_score` is a reciprocal-rank-fusion score (≈0.01–0.07), not a cosine similarity.** Don't put a cosine-style floor (0.5, 0.8) on it.
+  - **`relevance` (since Sep 2026, optional):** `{"score": 0.0–3.0, "same_failure": bool, "basis": "jev"}` — AIMS' Jev judgment of how closely this past incident's *failure* matches the current incident's, read from the current incident's evidence and the past incident's summary + resolution notes. 0 unrelated · 1 same system, different failure · 2 similar failure, fix may not apply as-is · 3 same failure, its fix applies (`same_failure` = score ≥ 2.5). Absent when Jev was unavailable — fall back to your own matching. **Prefer it over title similarity**: alert titles are often boilerplate (143 AIMS incidents share `[#grafana-errors-prod] Error Details Below`), so a high `similarity_score` alone says little.
 - **`context.runbooks`** are Confluence chunks retrieved via ontology's hybrid search using the incident title as the query. Empty array is fine.
 - **`constraints.correlation_id`** appears in AIMS logs and Langfuse traces. Echo it in server-side logs for cross-service debugging.
 
@@ -416,6 +418,8 @@ Simplified from `agent-service`:
 5. If any recommended_action.requires_approval and user clicks the confirm button:
    → aims_execute_action(action_id, approval) → surface the execution outcome in the chat.
 ```
+
+**Resolution memory convention.** When your server recognises that the current failure was resolved before (from your own store, or from `similar_past_incidents` rows with `relevance.same_failure`), put ONE sentence in `analysis` starting with `Resolution memory:` — e.g. matchstrat-mcp: "Resolution memory: this process has settled the same breaks before — total_qty → use_main (13 past decision(s), 98% confidence)."; tradeops-nifi-mcp: "Resolution memory: this failure was resolved before (1 past incident) — <id>: <fix>.". AIMS' triage template lifts that sentence verbatim into the answer's verdict. If you emit none, AIMS falls back to a `SAME FAILURE` similar incident in its own context, and only says "no prior resolution memory on this pattern yet" when neither exists — so only cite past incidents in `cited_past_incidents` that actually apply.
 
 The **agent-service change is additive**. Existing "Resolve with AI" continues to work when the router returns 404 (no MCP registered for the app), server times out, or the discovery capabilities don't match the incident.
 
