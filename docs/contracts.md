@@ -58,15 +58,15 @@ CRUD service with zero runtime coupling to the targets. We picked this
 when the consumer count was 1; if it grows, revisit.
 
 The contract with target servers is small on purpose: **discovery + one
-required tool + one optional tool**. If a team wants to expose more
+required tool + two optional tools**. If a team wants to expose more
 (metrics readers, log tailers, whatever), they use standard MCP
 `tools/list` — consumers may surface those to their LLM naturally. But
-the two AIMS-specific tools below are the load-bearing bits consumers
+the AIMS-specific tools below are the load-bearing bits consumers
 call deterministically.
 
 ---
 
-## 2. The three tools
+## 2. The tools
 
 ### 2.1 `aims_discover_capabilities` (REQUIRED)
 
@@ -285,6 +285,132 @@ Field notes:
 
 ---
 
+### 2.4 `aims_answer_question` (OPTIONAL)
+
+The same specialist, asked about one **subject** instead of one incident. A consumer calls it when a person's
+question is about something this application owns (a flow, a recon, a job) and needs what the application
+knows *now*: its current state, and a diagnosis when something is wrong. `aims_propose_resolution` needs an
+incident and returns `unable_to_diagnose` without one; this tool needs only the subject.
+
+It is always side-effect free. Servers MUST annotate it read-only and MUST NOT execute anything from it,
+whatever `read_only_default` says.
+
+**Input:**
+
+```json
+{
+  "question": "did the LSEG_SecMaster_Daily flow fail today?",
+  "subject": {
+    "kind": "flow",
+    "name": "LSEG_SecMaster_Daily",
+    "id": null,
+    "environment": "Production",
+    "run": { "id": null, "time": "2026-11-14T04:15:01Z", "url": null }
+  },
+  "context": {
+    "intent": "status",
+    "facts": ["Latest run 2026-11-14T04:15:01Z: PARTIALLY_FAILED"],
+    "lineage": { "...": "optional; the same block as aims_propose_resolution's context.lineage" }
+  },
+  "constraints": {
+    "max_response_ms": 30000,
+    "read_only": true,
+    "correlation_id": "aims-ask:9f1c…"
+  },
+  "origin": "aims-ask"
+}
+```
+
+Field notes:
+
+- **`subject` is what the server answers from.** `kind` is the server's own vocabulary (`flow`, `recon`, …); a
+  server returns `unable_to_answer` for a kind it does not own. `name` is always present; `id`, `environment`
+  and `run` are sent when the consumer has them. With no `run`, the server answers about the newest one.
+- **`question` is the person's words, as typed.** It is there for logs, traces and servers that have a model.
+  A server MUST be able to answer from `subject` alone: a rule-based server never has to parse English.
+- **`context.intent`** is `status` or `diagnosis`: the consumer's own judgment of the question. It is a hint.
+  A server reports state either way, and diagnoses whenever it sees a problem.
+- **`context.facts`** are things the consumer already read **from this same application**, so the server
+  need not re-read them. A consumer MUST NOT send facts from another system, and MUST NOT send business rows.
+- **`constraints.max_response_ms`** is a deadline. A server that cannot finish MUST reply in time with what it
+  has (`partial: true`), not time out.
+
+**Output:**
+
+```json
+{
+  "server_name": "stratops",
+  "subject": { "kind": "flow", "name": "LSEG_SecMaster_Daily", "id": "4d1c…", "environment": "Production",
+               "run": { "id": "77aa…", "time": "2026-11-14T04:15:01Z" } },
+  "observed_at": "2026-11-16T10:02:11Z",
+  "state": [
+    "Scheduled: 30 of 30 steps running; 0 queued flowfiles",
+    "Latest run 2026-11-14T04:15:01Z: PARTIALLY_FAILED at step Wait",
+    "Last 20 runs: 18 completed, 1 partially failed, 1 abandoned"
+  ],
+  "problem": true,
+  "partial": false,
+  "missing": [],
+  "unable_to_answer": false,
+
+  "confidence": 0.55,
+  "analysis": "The run stopped at Wait: its release signal never arrived because …",
+  "recommended_actions": [
+    { "kind": "diagnostic", "description": "Check the Notify step's last signal for this run.",
+      "reversible": true, "requires_approval": false, "action_id": null }
+  ],
+  "next_investigations": ["Compare with the 2026-11-13 run, which completed"],
+  "unable_to_diagnose": false,
+  "reasons": []
+}
+```
+
+Or when the server cannot find or read the subject:
+
+```json
+{
+  "server_name": "stratops",
+  "subject": { "kind": "flow", "name": "LSEG_SecMaster" },
+  "state": [],
+  "unable_to_answer": true,
+  "reasons": ["3 flows match this name"],
+  "candidates": ["LSEG_SecMaster_Daily", "LSEG_SecMaster_Daily_Recon", "LSEG_SecMaster_Intraday"]
+}
+```
+
+Field notes:
+
+- **`state[]` is first-hand.** Each entry is one sentence the server read from its own system at
+  `observed_at`: names, ids, statuses, counts and times. Never business rows or field values. Consumers show
+  it as that application's live evidence.
+- **`subject` is echoed as resolved**, with the ids and the run the answer is actually about. A consumer
+  tells the person which run that was.
+- **`problem`** is `true`, `false` or `null` (could not tell): does the server see something wrong with the
+  subject? `false` with a full `state` is a complete, useful answer.
+- **The diagnosis fields** (`confidence`, `analysis`, `recommended_actions`, `next_investigations`,
+  `unable_to_diagnose`, `reasons`) mean exactly what they mean in §2.2. They are the server's conclusion, not
+  first-hand state, and consumers label them as such. `unable_to_diagnose: true` with a full `state` means
+  "here is what I see; I cannot say why".
+- **`partial` / `missing[]`**: the deadline cut a read short. `missing` names what was not read
+  ("error search").
+- **`unable_to_answer: true`** is a first-class response, never an error: unknown kind, no such subject, or
+  several matches (then `candidates[]` lists their names).
+- **Actions.** A server may list actions as in §2.2. A consumer answering a question keeps `diagnostic` and
+  `information` descriptions and drops the rest; nothing from this tool is ever executed.
+
+**How a consumer finds out a server has it.** The registry's `capabilities` is a snapshot from registration
+time, so it cannot be trusted to list a tool added later. A consumer is configured with the servers that have the
+tool and confirms by calling it. A server without it refuses the call: an MCP "unknown tool" error, or, on a
+server that pins a token to a tool allowlist, that server's own refusal payload. The consumer treats any reply
+that has neither `state` nor `unable_to_answer` as "not available" and falls back to `aims_propose_resolution`,
+only for a question it judged a diagnosis. Adding this tool is additive (§11): no `protocol_version` change.
+
+**Deadline.** For this tool the consumer's `constraints.max_response_ms` applies, capped at 60000, even when it
+is longer than the `max_response_ms` the server declares in discovery for `aims_propose_resolution`. A server that
+needs less answers sooner.
+
+---
+
 ## 3. Registration flow
 
 Team X wants their application to be resolvable by AIMS:
@@ -353,7 +479,7 @@ Streamable-HTTP means:
 
 But **do not build this by hand** — use an MCP SDK. Bespoke `httpx.post` against `/tools/call` skips the initialize handshake and misses the Accept/session headers; spec-compliant servers reject it with `406 Not Acceptable` or `400 Missing session ID`.
 
-Servers may also implement `tools/list` to advertise beyond the required three tools — the agent will surface those tools to the LLM in "MCP-enriched" mode.
+Servers may also implement `tools/list` to advertise beyond these tools — the agent will surface those tools to the LLM in "MCP-enriched" mode.
 
 **Registration `endpoint_url`**: use the URL the SDK will POST to. For fastmcp mounted at `/mcp/`, register `http://your-svc:PORT/mcp/` — with the trailing slash. Bare `/mcp` responds `307 Temporary Redirect` to `/mcp/`; the SDK follows redirects, but avoiding the round-trip is cheap.
 
