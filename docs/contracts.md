@@ -305,7 +305,8 @@ whatever `read_only_default` says.
     "name": "LSEG_SecMaster_Daily",
     "id": null,
     "environment": "Production",
-    "run": { "id": null, "time": "2026-11-14T04:15:01Z", "url": null }
+    "run": { "id": null, "time": "2026-11-14T04:15:01Z", "url": null },
+    "steps": ["Wait"]
   },
   "context": {
     "intent": "status",
@@ -326,6 +327,10 @@ Field notes:
 - **`subject` is what the server answers from.** `kind` is the server's own vocabulary (`flow`, `recon`, …); a
   server returns `unable_to_answer` for a kind it does not own. `name` is always present; `id`, `environment`
   and `run` are sent when the consumer has them. With no `run`, the server answers about the newest one.
+- **`subject.steps`** (optional, at most 5 names): parts of the subject the question is about, such as the
+  steps of a flow. A server that knows them adds one `state[]` sentence per step (its status and counts, and
+  how many recent runs failed there) and says so when a name is not found. A server that does not simply
+  ignores the field.
 - **`question` is the person's words, as typed.** It is there for logs, traces and servers that have a model.
   A server MUST be able to answer from `subject` alone: a rule-based server never has to parse English.
 - **`context.intent`** is `status` or `diagnosis`: the consumer's own judgment of the question. It is a hint.
